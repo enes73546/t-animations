@@ -1,16 +1,18 @@
 use std::env;
 use std::io::{self, Write};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H\x1b[?25l";
+const RESET: &str = "\x1b[0m";
 
-const ANSI_COLORS: &[&str] = &[
+const COLORS: &[&str] = &[
     "\x1b[1;31m",
-    "\x1b[1;32m", 
-    "\x1b[1;33m", 
-    "\x1b[1;34m", 
-    "\x1b[1;35m", 
+    "\x1b[1;32m",
+    "\x1b[1;33m",
+    "\x1b[1;34m",
+    "\x1b[1;35m",
     "\x1b[1;36m",
     "\x1b[1;37m",
 ];
@@ -34,6 +36,12 @@ impl Direction {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Cell {
+    ch: char,
+    color: &'static str,
+}
+
 struct Pipe {
     x: i16,
     y: i16,
@@ -41,15 +49,15 @@ struct Pipe {
     color: &'static str,
 }
 
-struct SimpleRng(u64);
+struct FastRng(u64);
 
-impl SimpleRng {
+impl FastRng {
     fn new() -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos() as u64;
-        SimpleRng(seed)
+            .subsec_nanos() as u64;
+        FastRng(seed)
     }
 
     fn next(&mut self) -> u64 {
@@ -59,6 +67,34 @@ impl SimpleRng {
 
     fn range(&mut self, max: u64) -> u64 {
         if max == 0 { 0 } else { self.next() % max }
+    }
+}
+
+fn terminal_size() -> (i16, i16) {
+    let output = Command::new("cmd")
+        .args(["/C", "mode", "con"])
+        .output();
+
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut width = 120;
+        let mut height = 40;
+
+        for line in text.lines() {
+            if line.contains("Columns:") {
+                if let Some(val) = line.split(':').nth(1) {
+                    width = val.trim().parse().unwrap_or(120);
+                }
+            }
+            if line.contains("Lines:") {
+                if let Some(val) = line.split(':').nth(1) {
+                    height = val.trim().parse().unwrap_or(40);
+                }
+            }
+        }
+        (width.max(10), height.max(5))
+    } else {
+        (120, 40)
     }
 }
 
@@ -79,8 +115,8 @@ fn get_straight_symbol(dir: Direction) -> char {
     }
 }
 
-fn create_random_pipe(width: i16, height: i16, rng: &mut SimpleRng) -> Pipe {
-    let color = ANSI_COLORS[rng.range(ANSI_COLORS.len() as u64) as usize];
+fn create_random_pipe(width: i16, height: i16, rng: &mut FastRng) -> Pipe {
+    let color = COLORS[rng.range(COLORS.len() as u64) as usize];
     let side = rng.range(4);
 
     let (x, y, dir) = match side {
@@ -93,22 +129,31 @@ fn create_random_pipe(width: i16, height: i16, rng: &mut SimpleRng) -> Pipe {
     Pipe { x, y, dir, color }
 }
 
-fn run_pipes(speed: u64) {
-    let mut rng = SimpleRng::new();
-    let width = 100i16;
-    let height = 30i16;
-
-    let mut grid = vec![vec![' '; width as usize]; height as usize];
+fn pipes(speed: u64, cross_chance: u64) {
+    let mut rng = FastRng::new();
+    let mut size = terminal_size();
+    let empty_cell = Cell { ch: ' ', color: RESET };
+    let mut grid = vec![vec![empty_cell; size.0 as usize]; size.1 as usize];
     let mut active_pipes: Vec<Pipe> = Vec::new();
 
     print!("{}", CLEAR_SCREEN);
     io::stdout().flush().unwrap();
 
-    let frame_delay = Duration::from_millis(60 / speed.clamp(1, 5));
+    let delay = Duration::from_millis(45 / speed.clamp(1, 5));
 
     loop {
-        if rng.range(4) == 0 || active_pipes.is_empty() {
-            if active_pipes.len() < 10 {
+        let new_size = terminal_size();
+        if new_size != size {
+            size = new_size;
+            grid = vec![vec![empty_cell; size.0 as usize]; size.1 as usize];
+            print!("{}", CLEAR_SCREEN);
+            active_pipes.clear();
+        }
+
+        let (width, height) = size;
+
+        if rng.range(3) == 0 || active_pipes.is_empty() {
+            if active_pipes.len() < 25 {
                 active_pipes.push(create_random_pipe(width, height, &mut rng));
             }
         }
@@ -124,41 +169,53 @@ fn run_pipes(speed: u64) {
 
             let ux = pipe.x as usize;
             let uy = pipe.y as usize;
+            let current_cell = grid[uy][ux];
 
-            if grid[uy][ux] != ' ' {
-                active_pipes.remove(i);
-                continue;
-            }
+            let symbol;
+            let mut next_dir = pipe.dir;
 
-            let is_turning = rng.range(5) == 0;
-            let next_dir = if is_turning {
-                match pipe.dir {
-                    Direction::Up | Direction::Down => {
-                        if rng.range(2) == 0 { Direction::Left } else { Direction::Right }
-                    }
-                    Direction::Left | Direction::Right => {
-                        if rng.range(2) == 0 { Direction::Up } else { Direction::Down }
-                    }
+            if current_cell.ch != ' ' {
+                if current_cell.color == pipe.color {
+                    active_pipes.remove(i);
+                    continue;
+                }
+
+                let can_cross = cross_chance == 100 || (cross_chance > 0 && rng.range(100) < cross_chance);
+
+                if current_cell.ch != '╬' && can_cross {
+                    symbol = '╬';
+                } else {
+                    active_pipes.remove(i);
+                    continue;
                 }
             } else {
-                pipe.dir
-            };
+                let is_turning = rng.range(6) == 0;
+                if is_turning {
+                    next_dir = match pipe.dir {
+                        Direction::Up | Direction::Down => {
+                            if rng.range(2) == 0 { Direction::Left } else { Direction::Right }
+                        }
+                        Direction::Left | Direction::Right => {
+                            if rng.range(2) == 0 { Direction::Up } else { Direction::Down }
+                        }
+                    };
+                    symbol = get_turn_symbol(pipe.dir, next_dir);
+                } else {
+                    symbol = get_straight_symbol(pipe.dir);
+                }
+            }
 
-            let symbol = if is_turning {
-                get_turn_symbol(pipe.dir, next_dir)
-            } else {
-                get_straight_symbol(pipe.dir)
-            };
-
-            grid[uy][ux] = symbol;
+            grid[uy][ux] = Cell { ch: symbol, color: pipe.color };
 
             print!(
-                "\x1b[{};{}H{}{}\x1b[0m",
+                "\x1b[{};{}H{}{}{}",
                 pipe.y + 1,
                 pipe.x + 1,
                 pipe.color,
-                symbol
+                symbol,
+                RESET
             );
+
             pipe.dir = next_dir;
             let (dx, dy) = pipe.dir.delta();
             pipe.x += dx;
@@ -168,22 +225,82 @@ fn run_pipes(speed: u64) {
         }
 
         io::stdout().flush().unwrap();
-        thread::sleep(frame_delay);
+        thread::sleep(delay);
+    }
+}
+
+fn invalid_speed_err() {
+    println!("[ \x1b[1;31mERROR\x1b[0m ] Speed Must Be Between 1x And 5x");
+}
+
+fn invalid_chance_err() {
+    println!("[ \x1b[1;31mERROR\x1b[0m ] Chance Must Be Between 1 And 100");
+}
+
+fn invalid_animation_err() {
+    println!("[ \x1b[1;31mERROR\x1b[0m ] Invalid Animation Please Run With Valid Arguments");
+}
+
+fn insufficient_args_err() {
+    println!("[ \x1b[1;31mERROR\x1b[0m ] Insufficient Arguments Please Enter The Animation ID or Name");
+}
+
+fn load_animation(args: &[String]) {
+    if args[0] == "0001" || args[0].to_lowercase() == "pipes" {
+        let mut speed = 1;
+        let mut chance = 12;
+
+        let mut idx = 1;
+        while idx < args.len() {
+            if args[idx] == "--speed" {
+                if idx + 1 >= args.len() {
+                    invalid_speed_err();
+                    return;
+                }
+                match args[idx + 1].parse::<u64>() {
+                    Ok(value) if (1..=5).contains(&value) => {
+                        speed = value;
+                        idx += 2;
+                    }
+                    _ => {
+                        invalid_speed_err();
+                        return;
+                    }
+                }
+            } else if args[idx] == "--chance" || args[idx] == "--change" {
+                if idx + 1 >= args.len() {
+                    invalid_chance_err();
+                    return;
+                }
+                match args[idx + 1].parse::<u64>() {
+                    Ok(value) if (1..=100).contains(&value) => {
+                        chance = value;
+                        idx += 2;
+                    }
+                    _ => {
+                        invalid_chance_err();
+                        return;
+                    }
+                }
+            } else {
+                invalid_animation_err();
+                return;
+            }
+        }
+
+        pipes(speed, chance);
+    } else {
+        invalid_animation_err();
     }
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 || (args[1] != "0001" && args[1].to_lowercase() != "pipes") {
-        println!("[ \x1b[1;31mERROR\x1b[0m ] Usage: cargo run -- pipes [--speed 1-5]");
+    if args.len() < 2 {
+        insufficient_args_err();
         return;
     }
 
-    let mut speed = 1;
-    if args.len() >= 4 && args[2] == "--speed" {
-        speed = args[3].parse::<u64>().unwrap_or(1);
-    }
-
-    run_pipes(speed);
+    load_animation(&args[1..]);
 }
